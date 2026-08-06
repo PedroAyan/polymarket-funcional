@@ -15,7 +15,7 @@ from py_clob_client.order_builder.constants import BUY, SELL
 # ================= CONFIGURAÇÕES =================
 
 # Carteira do Bot/Trader que você quer copiar
-TARGET_WALLET = "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"
+TARGET_WALLET = "***"
 
 # Modo de teste: True = Apenas simula / False = Gasta dinheiro real
 DRY_RUN = False 
