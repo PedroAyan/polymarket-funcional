@@ -1,332 +1,199 @@
-import os
+"""Bot de copy trading. Execute com python test.py."""
+import hashlib
 import json
+import os
+import re
+import sqlite3
 import time
-import logging
-import requests
-from datetime import datetime, timezone
+from collections import Counter
+from contextlib import closing
 from decimal import Decimal, ROUND_DOWN
+from pathlib import Path
+
 from dotenv import load_dotenv
+from polymarket import PublicClient, SecureClient, TradeActivity
+from polymarket.errors import PolymarketError, RateLimitError, RequestRejectedError
 
-# --- IMPORTS DA BIBLIOTECA OFICIAL DA POLYMARKET ---
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType, BalanceAllowanceParams, AssetType
-from py_clob_client.order_builder.constants import BUY, SELL
-
-# ================= CONFIGURAÇÕES =================
-
-# Carteira do Bot/Trader que você quer copiar
-TARGET_WALLET = "***"
-
-# Modo de teste: True = Apenas simula / False = Gasta dinheiro real
-DRY_RUN = False 
-
-# Filtro de Mercados: Deixe vazio [] para copiar tudo.
-# Exemplo: ["Bitcoin", "Ethereum", "XRP"]
-WHITELIST_WORDS = ["Bitcoin", "Ethereum", "XRP"]
-
-# --- GESTÃO DE BANCA ---
-# Modo de Aposta: "FIXED" (valor fixo) ou "RATIO" (porcentagem da aposta do alvo)
-BET_MODE = "FIXED" 
-
-# Se FIXED, quanto apostar por trade (em USDC)?
-FIXED_AMOUNT = Decimal("0.50") 
-
-# Se RATIO, qual a proporção? (0.10 = 10% do valor do alvo)
-COPY_RATIO = Decimal("0.10") 
-
-# Limites de Segurança
-MAX_USDC_PER_TRADE = Decimal("5.00")  # Nunca apostar mais que isso
-MIN_USDC_PER_TRADE = Decimal("0.10")  # Mínimo aceito pela Polymarket (aprox)
-
-# Configurações de Sistema
-STATE_FILE = "polymarket_copy_state.json"
-POLL_SECONDS = 1.0
-CLOB_HOST = "https://clob.polymarket.com"
-CHAIN_ID = 137  # Polygon Mainnet
-
-# Carrega as variáveis do arquivo .env
 load_dotenv()
+TARGET_WALLET = os.getenv("TARGET_WALLET", "").strip()
+DRY_RUN = True
+WHITELIST_WORDS = ["Bitcoin", "Ethereum", "XRP"]
+BET_MODE = "FIXED"
+FIXED_AMOUNT = Decimal("0.50")
+COPY_RATIO = Decimal("0.10")
+MAX_USDC_PER_TRADE = Decimal("5.00")
+MIN_USDC_PER_TRADE = Decimal("0.10")
+POLL_SECONDS = 1
+OVERLAP_SECONDS = 60
+CENT = Decimal("0.01")
 
-# ================= FUNÇÕES AUXILIARES =================
 
-def load_state():
-    if not os.path.exists(STATE_FILE):
-        return {"seen_tx": [], "last_timestamp": 0}
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            data.setdefault("seen_tx", [])
-            data.setdefault("last_timestamp", 0)
-            return data
-    except:
-        return {"seen_tx": [], "last_timestamp": 0}
+def open_state(path):
+    db = sqlite3.connect(path)
+    db.row_factory = sqlite3.Row
+    with db:
+        db.execute("""CREATE TABLE IF NOT EXISTS trades (
+            id TEXT PRIMARY KEY, tx TEXT NOT NULL, asset TEXT NOT NULL,
+            timestamp INTEGER NOT NULL, title TEXT NOT NULL, price TEXT NOT NULL,
+            amount TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+            retry_at INTEGER NOT NULL DEFAULT 0, detail TEXT NOT NULL DEFAULT ''
+        )""")
+        db.execute("CREATE INDEX IF NOT EXISTS queue ON trades(status, retry_at)")
+    return db
 
-def save_state(seen_tx_list, last_timestamp):
-    # Mantém apenas os últimos 5000 IDs para não deixar o arquivo gigante
-    if len(seen_tx_list) > 5000:
-        seen_tx_list = seen_tx_list[-5000:]
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"seen_tx": seen_tx_list, "last_timestamp": int(last_timestamp)}, f)
 
-def iso_time(ts: int) -> str:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M:%S")
+def collect(client, db, wallet, start, end):
+    pages = client.list_activity(user=wallet, activity_types=["TRADE"], side="BUY",
+                                 sort_direction="ASC", start=start, end=end)
+    occurrences = Counter()
+    # Commit the whole window or retry it. A partial page walk never advances the cursor.
+    with db:
+        for page in pages:
+            for trade in page.items:
+                if not isinstance(trade, TradeActivity) or trade.side != "BUY":
+                    continue
+                title = trade.title or ""
+                if WHITELIST_WORDS and not any(w.lower() in title.lower() for w in WHITELIST_WORDS):
+                    continue
+                ts = int(trade.timestamp.timestamp())
+                # The activity feed has no fill ID. Count even identical fills in the same tx.
+                identity = json.dumps([trade.transaction_hash.lower(), ts, trade.asset_id,
+                                       trade.side, *[str(n.normalize()) for n in
+                                                     (trade.price, trade.shares, trade.amount)]])
+                occurrences[identity] += 1
+                key = hashlib.sha256(identity.encode()).hexdigest() + f"-{occurrences[identity]}"
+                db.execute("""INSERT INTO trades(id, tx, asset, timestamp, title, price, amount)
+                           VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING""",
+                           (key, trade.transaction_hash, trade.asset_id, ts, title,
+                            str(trade.price), str(trade.amount)))
+            if page.limit_reached:
+                raise ValueError("A API interrompeu a paginação antes de confirmar o fim.")
 
-def quantize_usdc(x: Decimal) -> Decimal:
-    return x.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-# --- API DE DADOS (MONITORAMENTO) ---
-def fetch_trades(start_ts=None, end_ts=None, limit=50):
-    url = "https://data-api.polymarket.com/activity"
-    params = {
-        "user": TARGET_WALLET,
-        "limit": limit,
-        "type": "TRADE",
-        "sortBy": "TIMESTAMP",
-        "sortDirection": "ASC",
-    }
-    if start_ts: params["start"] = int(start_ts)
-    if end_ts: params["end"] = int(end_ts)
+class SkipTrade(ValueError):
+    pass
 
-    try:
-        r = requests.get(url, params=params, timeout=5)
-        if r.status_code == 429: return "RATE_LIMIT", []
-        if r.status_code != 200: return f"HTTP_{r.status_code}", []
-        data = r.json()
-        return "OK", (data if isinstance(data, list) else [])
-    except Exception as e:
-        return f"ERR_{type(e).__name__}", []
 
-# --- INTEGRAÇÃO COM GAMMA (Para descobrir o Token ID) ---
-def get_market_token_id(condition_id: str, outcome_index: int) -> str:
-    """Busca o Market ID e Token ID correto baseado na conditionId da aposta."""
-    url = "https://gamma-api.polymarket.com/markets"
-    try:
-        r = requests.get(url, params={"condition_ids": condition_id}, timeout=5)
-        r.raise_for_status()
-        data = r.json()
-        if not data: return None
-        
-        market = data[0]
-        clob_ids = market.get("clobTokenIds")
-        
-        if isinstance(clob_ids, str):
-            clob_ids = json.loads(clob_ids)
-            
-        if clob_ids and len(clob_ids) > outcome_index:
-            return str(clob_ids[outcome_index])
-        return None
-    except Exception as e:
-        print(f"❌ Erro ao buscar Token ID: {e}")
-        return None
+def prepare_order(client, trade):
+    observed = Decimal(trade["price"])
+    if not observed.is_finite() or not 0 < observed < 1:
+        raise SkipTrade("Preço fora do intervalo (0, 1).")
+    budget = FIXED_AMOUNT if BET_MODE == "FIXED" else Decimal(trade["amount"]) * COPY_RATIO
+    budget = min(budget, MAX_USDC_PER_TRADE).quantize(CENT, rounding=ROUND_DOWN)
+    if budget < MIN_USDC_PER_TRADE:
+        raise SkipTrade("Valor abaixo do mínimo configurado.")
+    book = client.get_order_book(asset_id=trade["asset"])
+    tick = book.tick_size
+    if tick <= 0 or book.min_order_size <= 0 or book.asset_id != trade["asset"]:
+        raise ValueError("Livro de ordens inconsistente.")
+    # A price averaged across fills may fall between ticks. Never bid above it.
+    price = (observed // tick) * tick
+    if price < tick or price > 1 - tick:
+        raise SkipTrade("Preço fora da grade do mercado.")
+    size = (budget / price).quantize(CENT, rounding=ROUND_DOWN)
+    if size < book.min_order_size or size * price < MIN_USDC_PER_TRADE:
+        raise SkipTrade(f"{size} cotas a {price} fora dos mínimos do mercado ou da configuração.")
+    return price, size
 
-# --- CLIENTE DE EXECUÇÃO (CLOB) ---
-def init_clob_client():
-    key = os.getenv("POLY_PRIVATE_KEY")
-    funder = os.getenv("POLY_FUNDER")
-    sig_type = int(os.getenv("POLY_SIGNATURE_TYPE", "1")) # Padrão 1
 
-    if not key or not funder:
-        raise ValueError("ERRO: Configure POLY_PRIVATE_KEY e POLY_FUNDER no arquivo .env")
+def transition(db, key, previous, status, detail, retry_at=0):
+    with db:
+        changed = db.execute("""UPDATE trades SET status=?, detail=?, retry_at=?
+                                WHERE id=? AND status=?""",
+                             (status, detail, retry_at, key, previous)).rowcount
+    if changed:
+        print(f"[{status}] {key[:12]} {detail}", flush=True)
+    return bool(changed)
 
-    print("🔑 Iniciando cliente autenticado...")
-    client = ClobClient(
-        host=CLOB_HOST,
-        key=key,
-        chain_id=CHAIN_ID,
-        signature_type=sig_type,
-        funder=funder
-    )
-    # Cria as credenciais de API se necessário
-    try:
-        creds = client.derive_api_key()
-        client.set_api_creds(creds)
-    except Exception as e:
-        print(f"⚠️ Aviso na criação de credenciais (pode já estar ok): {e}")
-    
-    return client
 
-def get_usdc_balance(client: ClobClient) -> Decimal:
-    """Verifica saldo de COLATERAL (USDC) na Polymarket"""
-    try:
-        resp = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
-        raw_bal = Decimal(resp['balance']) # Vem em wei (6 casas decimais para USDC na Polygon)
-        return raw_bal / Decimal("1000000")
-    except Exception as e:
-        print(f"❌ Erro ao checar saldo: {e}")
-        return Decimal("0")
+def defer(db, trade, previous, reason):
+    delay = max(5, getattr(reason, "retry_after", None) or 0)
+    transition(db, trade["id"], previous, "pending", str(reason), time.time() + delay)
 
-def place_order(client: ClobClient, token_id: str, side: str, price: float, size_usdc: Decimal):
-    """Envia uma Limit Order (GTC) no preço que o alvo pagou"""
-    
-    # Converter USDC para quantidade de shares
-    # Size (shares) = USDC / Preço
-    if price <= 0: 
-        print("❌ Preço inválido.")
-        return None
 
-    size_shares = float(size_usdc) / price
-    size_shares = round(size_shares, 2) # Arredonda para 2 casas
+def process_queue(client, db, dry_run):
+    rows = db.execute("""SELECT * FROM trades WHERE status='pending' AND retry_at<=?
+                         ORDER BY timestamp, rowid""", (time.time(),)).fetchall()
+    for trade in rows:
+        key = trade["id"]
+        try:
+            price, size = prepare_order(client, trade)
+            summary = f'{trade["title"]} | {size} cotas a {price} | {price * size} pUSD'
+            if dry_run:
+                transition(db, key, "pending", "simulated", summary)
+                continue
+            balance = client.get_balance_allowance(asset_type="COLLATERAL").balance
+            if price * size > Decimal(balance) / 1_000_000:
+                raise SkipTrade("Saldo insuficiente.")
+            signed = client.create_limit_order(asset_id=trade["asset"], price=price, size=size, side="BUY")
+        except SkipTrade as exc:
+            transition(db, key, "pending", "skipped", str(exc))
+            continue
+        except (PolymarketError, ValueError) as exc:
+            defer(db, trade, "pending", exc)
+            continue
 
-    # Define BUY ou SELL baseado na string
-    order_side = BUY if side.upper() == "BUY" else SELL
+        # Commit before POST. A crash or a lost reply must never cause a second signature/send.
+        if not transition(db, key, "pending", "unconfirmed", summary):
+            continue
+        try:
+            reply = client.post_order(signed)
+        except RateLimitError as exc:
+            defer(db, trade, "unconfirmed", exc)
+        except RequestRejectedError as exc:
+            if exc.status in (425, 429):
+                defer(db, trade, "unconfirmed", exc)
+            elif 400 <= exc.status < 500 and exc.status not in (408, 409):
+                transition(db, key, "unconfirmed", "rejected", str(exc))
+            else:
+                print(f"Envio incerto ({exc}). Confira a ordem na carteira: {summary}", flush=True)
+        except PolymarketError as exc:
+            print(f"Envio incerto ({exc}). Confira a ordem na carteira: {summary}", flush=True)
+        else:
+            if reply.ok:
+                transition(db, key, "unconfirmed", "accepted", f"{reply.order_id} ({reply.status})")
+            elif reply.code in ("market_not_ready", "post_only_mode"):
+                defer(db, trade, "unconfirmed", reply.message)
+            else:
+                transition(db, key, "unconfirmed", "rejected", reply.message)
 
-    print(f"🔄 Preparando ordem: {side} {size_shares} shares @ ${price} (Total: ${size_usdc})")
-
-    try:
-        order_args = OrderArgs(
-            price=price,
-            size=size_shares,
-            side=order_side,
-            token_id=token_id
-        )
-        signed_order = client.create_order(order_args)
-        resp = client.post_order(signed_order, OrderType.GTC)
-        return resp
-    except Exception as e:
-        print(f"❌ Falha ao enviar ordem: {e}")
-        return None
-
-# ================= LOOP PRINCIPAL =================
 
 def main():
-    print("🚀 BOT DE COPY TRADING INICIADO")
-    print(f"🎯 Alvo: {TARGET_WALLET}")
-    print(f"🧪 DRY_RUN (Simulação): {DRY_RUN}")
-    
-    client = None
-    if not DRY_RUN:
-        try:
-            client = init_clob_client()
-            bal = get_usdc_balance(client)
-            print(f"💰 Seu Saldo USDC: ${bal:.2f}")
-        except Exception as e:
-            print(f"🛑 Erro fatal na autenticação: {e}")
-            return
+    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", TARGET_WALLET):
+        raise SystemExit("Configure TARGET_WALLET com o endereço público a acompanhar.")
+    if BET_MODE not in ("FIXED", "RATIO") or not 0 < MIN_USDC_PER_TRADE <= MAX_USDC_PER_TRADE:
+        raise SystemExit("Confira BET_MODE e os limites por operação.")
+    if DRY_RUN:
+        client = PublicClient()
+        account = "sim"
+    else:
+        key, funder = os.getenv("POLY_PRIVATE_KEY"), os.getenv("POLY_FUNDER")
+        if not key or not funder:
+            raise SystemExit("Configure POLY_PRIVATE_KEY e POLY_FUNDER no .env.")
+        client = SecureClient.create(private_key=key, wallet=funder)
+        account = client.wallet.lower()
 
-    state = load_state()
-    seen_tx = set(state.get("seen_tx", []))
-    last_timestamp = state.get("last_timestamp", int(time.time()))
+    path = Path(__file__).with_name(f"copy_{TARGET_WALLET.lower()}_{account}.sqlite3")
+    start = int(time.time()) + 1
+    window = start
+    with client, closing(open_state(path)) as db:
+        print(f"Alvo {TARGET_WALLET} | {'SIMULAÇÃO' if DRY_RUN else 'ORDENS REAIS'} | {path.name}")
+        for row in db.execute("SELECT tx, asset, detail FROM trades WHERE status='unconfirmed'"):
+            print(f'Confira o envio na carteira: {row["tx"]} | ativo {row["asset"]} | {row["detail"]}')
+        while True:
+            end = int(time.time())
+            delay = POLL_SECONDS
+            if end >= window:
+                try:
+                    collect(client, db, TARGET_WALLET, window, end)
+                except (PolymarketError, ValueError) as exc:
+                    print(f"Consulta de atividade falhou: {exc}", flush=True)
+                    delay = max(5, getattr(exc, "retry_after", None) or 0)
+                else:
+                    window = max(start, end - OVERLAP_SECONDS)
+            process_queue(client, db, DRY_RUN)
+            time.sleep(delay)
 
-    print("⏳ Sincronizando estado inicial...")
-    # Faz uma busca inicial só para marcar o que já existe como visto
-    _, initial_items = fetch_trades(limit=50)
-    for item in initial_items:
-        tx = item.get("transactionHash")
-        if tx: seen_tx.add(tx)
-    
-    # Atualiza timestamp para AGORA, para não pegar trades velhos
-    last_timestamp = int(time.time())
-    save_state(list(seen_tx), last_timestamp)
-    print("✅ Sincronizado. Aguardando novas apostas...\n")
-
-    while True:
-        try:
-            current_time = int(time.time())
-            status, items = fetch_trades(start_ts=last_timestamp + 1, end_ts=current_time, limit=20)
-
-            if status == "RATE_LIMIT":
-                time.sleep(5)
-                continue
-            
-            if status != "OK":
-                print(f"⚠️ API Status: {status}")
-                time.sleep(POLL_SECONDS)
-                continue
-
-            if not items:
-                # print(".", end="", flush=True) # Feedback visual opcional
-                time.sleep(POLL_SECONDS)
-                continue
-
-            for item in items:
-                tx = item.get("transactionHash")
-                ts = int(item.get("timestamp", 0))
-                
-                # Ignora se já vimos ou se é timestamp antigo
-                if not tx or tx in seen_tx: continue
-                
-                last_timestamp = max(last_timestamp, ts)
-                seen_tx.add(tx) # Marca como visto imediatamente
-
-                # Dados da aposta do Alvo
-                side = item.get("side") # BUY ou SELL
-                target_usdc = Decimal(str(item.get("usdcSize", "0")))
-                price = float(item.get("price", "0"))
-                outcome = item.get("outcome")
-                title = item.get("title", "Unknown")
-                
-                # --- FILTRO 1: Whitelist de Palavras ---
-                if WHITELIST_WORDS:
-                    found = False
-                    for word in WHITELIST_WORDS:
-                        if word.lower() in title.lower():
-                            found = True
-                            break
-                    if not found:
-                        print(f"🚫 Ignorado (Filtro): {title[:30]}...")
-                        continue
-
-                # --- FILTRO 2: Apenas Compras (Opcional, mas recomendado para copy) ---
-                if side != "BUY":
-                    print(f"🚫 Ignorado (Venda): {side} em {title[:20]}")
-                    continue
-
-                print(f"\n🔔 NOVA APOSTA DETECTADA!")
-                print(f"📅 {iso_time(ts)} | {side} {outcome} | Alvo: ${target_usdc:.2f} | Preço: {price}")
-                print(f"📜 Mercado: {title}")
-
-                if DRY_RUN:
-                    print("🧪 Simulação: Trade teria sido executado.")
-                    continue
-
-                # --- LÓGICA DE EXECUÇÃO REAL ---
-                if client:
-                    # 1. Verifica saldo atual
-                    my_balance = get_usdc_balance(client)
-                    
-                    # 2. Calcula quanto apostar
-                    my_wager = Decimal("0")
-                    if BET_MODE == "FIXED":
-                        my_wager = FIXED_AMOUNT
-                    else:
-                        my_wager = target_usdc * COPY_RATIO
-                    
-                    # Travas de segurança
-                    my_wager = min(my_wager, MAX_USDC_PER_TRADE)
-                    my_wager = quantize_usdc(my_wager)
-
-                    if my_wager > my_balance:
-                        print(f"⚠️ Saldo insuficiente (${my_balance}) para aposta de ${my_wager}")
-                        continue
-                    
-                    if my_wager < MIN_USDC_PER_TRADE:
-                        print(f"⚠️ Valor muito baixo (${my_wager}). Mínimo é ${MIN_USDC_PER_TRADE}")
-                        continue
-
-                    # 3. Busca Token ID
-                    condition_id = item.get("conditionId")
-                    outcome_idx = item.get("outcomeIndex")
-                    
-                    token_id = get_market_token_id(condition_id, int(outcome_idx))
-                    
-                    if token_id:
-                        # 4. Envia a Ordem
-                        resp = place_order(client, token_id, side, price, my_wager)
-                        if resp and resp.get("orderID"):
-                            print(f"✅ ORDEM SUCESSO! ID: {resp.get('orderID')}")
-                        else:
-                            print(f"❌ Falha no envio: {resp}")
-                    else:
-                        print("❌ Não foi possível encontrar o Token ID para este mercado.")
-
-            # Salva estado após processar o lote
-            save_state(list(seen_tx), last_timestamp)
-
-        except Exception as e:
-            print(f"Erro no loop principal: {e}")
-            time.sleep(2)
-        
-        time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":
     main()
